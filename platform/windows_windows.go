@@ -8,7 +8,9 @@ import (
 	"image/png"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -24,18 +26,16 @@ var (
 	postQuitMessage     = user32.NewProc("PostQuitMessage")
 	showWindow          = user32.NewProc("ShowWindow")
 	updateWindow        = user32.NewProc("UpdateWindow")
-	getMessageW         = user32.NewProc("GetMessageW")
+	peekMessageW        = user32.NewProc("PeekMessageW")
 	translateMessage    = user32.NewProc("TranslateMessage")
 	dispatchMessageW    = user32.NewProc("DispatchMessageW")
 	setWindowPos        = user32.NewProc("SetWindowPos")
 	getDC               = user32.NewProc("GetDC")
 	releaseDC           = user32.NewProc("ReleaseDC")
 	loadCursorW         = user32.NewProc("LoadCursorW")
-	setCursor           = user32.NewProc("SetCursor")
 	getModuleHandleW    = kernel32.NewProc("GetModuleHandleW")
-	setCapture          = user32.NewProc("SetCapture")
-	releaseCapture      = user32.NewProc("ReleaseCapture")
 	getCursorPos        = user32.NewProc("GetCursorPos")
+	getAsyncKeyState    = user32.NewProc("GetAsyncKeyState")
 	getWindowRect       = user32.NewProc("GetWindowRect")
 	postMessageW        = user32.NewProc("PostMessageW")
 	beginPaint          = user32.NewProc("BeginPaint")
@@ -43,12 +43,12 @@ var (
 	updateLayeredWindow = user32.NewProc("UpdateLayeredWindow")
 	destroyWindow       = user32.NewProc("DestroyWindow")
 	getSystemMetrics    = user32.NewProc("GetSystemMetrics")
+	setTimer            = user32.NewProc("SetTimer")
 	// 菜单相关
-	createPopupMenu  = user32.NewProc("CreatePopupMenu")
-	appendMenuW      = user32.NewProc("AppendMenuW")
-	trackPopupMenu   = user32.NewProc("TrackPopupMenu")
-	createPopupMenu_ = user32.NewProc("CreatePopupMenu")
-	destroyMenu      = user32.NewProc("DestroyMenu")
+	createPopupMenu = user32.NewProc("CreatePopupMenu")
+	appendMenuW     = user32.NewProc("AppendMenuW")
+	trackPopupMenu  = user32.NewProc("TrackPopupMenu")
+	destroyMenu     = user32.NewProc("DestroyMenu")
 
 	// gdi32 procs
 	createSolidBrush   = gdi32.NewProc("CreateSolidBrush")
@@ -77,24 +77,19 @@ const (
 
 	GWL_EXSTYLE int32 = -20
 
-	WM_DESTROY         = 0x0002
-	WM_PAINT           = 0x000F
-	WM_LBUTTONDOWN     = 0x0201
-	WM_LBUTTONUP       = 0x0202
-	WM_MOUSEMOVE       = 0x0200
-	WM_RBUTTONDOWN     = 0x0204
-	WM_RBUTTONUP       = 0x0205
-	WM_NCHITTEST       = 0x0084
-	WM_NCLBUTTONDOWN   = 0x00A1
-	WM_NCLBUTTONUP     = 0x00A2
-	WM_NCLBUTTONDBLCLK = 0x00A3
-	WM_NCRBUTTONDOWN   = 0x00A4
-	WM_NCRBUTTONUP     = 0x00A5
-	WM_NCMOUSEMOVE     = 0x00A0
-	WM_LBUTTONDBLCLK   = 0x0203
-	WM_SETCURSOR       = 0x0020
-	WM_UPDATE_DISPLAY  = 0x0401
-	WM_COMMAND         = 0x0111
+	WM_DESTROY        = 0x0002
+	WM_QUIT           = 0x0012
+	PM_REMOVE         = 0x0001
+	WM_PAINT          = 0x000F
+	WM_LBUTTONDOWN    = 0x0201
+	WM_MOUSEMOVE      = 0x0200
+	WM_RBUTTONDOWN    = 0x0204
+	WM_RBUTTONUP      = 0x0205
+	WM_NCHITTEST      = 0x0084
+	WM_UPDATE_DISPLAY = 0x0401
+	WM_DRAG_MOVE      = 0x0402 // 异步拖拽移动消息
+	WM_TIMER          = 0x0113
+	WM_COMMAND        = 0x0111
 
 	// 菜单相关
 	MF_STRING     = 0x00000000
@@ -108,10 +103,13 @@ const (
 	ID_EXIT            = 1003
 	ID_EXPRESSION_BASE = 2000 // 表情菜单 ID 从 2000 开始
 
+	HEARTBEAT_TIMER_ID = 3 // 心跳定时器 ID，保持消息队列活跃，避免系统判定窗口"无响应"
+
 	HTCAPTION = 2
 	HTCLIENT  = 1
 
 	VK_LBUTTON = 0x01
+	VK_RBUTTON = 0x02
 
 	SW_SHOW = 5
 
@@ -227,6 +225,7 @@ type windowsPlatform struct {
 	currentBubble      string
 	// 图片数据
 	basePixels []byte
+	pixelMu    sync.Mutex // 保护 basePixels 的读写
 	memDC      uintptr
 	hBitmap    uintptr
 	bmpPtr     unsafe.Pointer
@@ -241,12 +240,17 @@ type windowsPlatform struct {
 	// 缩放
 	scale float64 // 当前缩放比例
 	// 右键拖动/单击
-	dragStartX int32
-	dragStartY int32
-	winStartX  int32
-	winStartY  int32
-	dragging   bool
-	isDrag     bool // 是否是拖动（vs 单击）
+	dragStartX      int32
+	dragStartY      int32
+	winStartX       int32
+	winStartY       int32
+	dragging        bool
+	isDrag          bool  // 是否是拖动（vs 单击）
+	skipPaint       bool  // 拖拽时跳过重绘
+	lastNewX        int32 // 上次设置的窗口X
+	lastNewY        int32 // 上次设置的窗口Y
+	hasLastPos      bool  // 是否有上次位置记录
+	dragMovePending bool  // 是否已投递了 WM_DRAG_MOVE（避免重复投递）
 }
 
 func (w *windowsPlatform) Init() error {
@@ -336,6 +340,11 @@ func (w *windowsPlatform) loadImageByName(name string, targetWidth, targetHeight
 
 	// 转换为 BGRA 格式，统一尺寸（包含偏移区域）
 	pixels := make([]byte, width*(height+offsetY)*4)
+	// 初始化所有像素 alpha=1，避免 WS_EX_LAYERED + UpdateLayeredWindow 窗口的透明像素点击穿透
+	// alpha=1 视觉上几乎不可见（0.4% 不透明），但系统认为像素不透明，不穿透鼠标点击
+	for i := 3; i < len(pixels); i += 4 {
+		pixels[i] = 1
+	}
 	for y := 0; y < height; y++ {
 		for x := 0; x < width; x++ {
 			idx := ((y+offsetY)*width + x) * 4
@@ -498,7 +507,9 @@ func (w *windowsPlatform) wndProc(hwnd HWND, msg uint32, wParam, lParam uintptr)
 		var ps PAINTSTRUCT
 		beginPaint.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&ps)))
 		endPaint.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&ps)))
-		w.updateDisplay()
+		if !w.skipPaint {
+			w.updateDisplay()
+		}
 		return 0
 
 	case WM_NCHITTEST:
@@ -515,7 +526,7 @@ func (w *windowsPlatform) wndProc(hwnd HWND, msg uint32, wParam, lParam uintptr)
 		return 0
 
 	case WM_RBUTTONDOWN:
-		// 右键按下：记录起始位置
+		// 右键按下：记录起始位置，启动 goroutine 轮询鼠标状态（不使用 SetCapture，避免消息阻塞）
 		var pt POINT
 		getCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
 		w.dragStartX = pt.X
@@ -525,40 +536,66 @@ func (w *windowsPlatform) wndProc(hwnd HWND, msg uint32, wParam, lParam uintptr)
 		w.winStartX = rect.Left
 		w.winStartY = rect.Top
 		w.dragging = true
-		w.isDrag = false // 初始化为非拖动
-		setCapture.Call(uintptr(hwnd))
+		w.isDrag = false
+		w.skipPaint = true
+		w.hasLastPos = false
+		w.dragMovePending = false
+		w.startDragGoroutine(hwnd)
 		return 0
 
 	case WM_MOUSEMOVE:
-		// 右键拖动检测
-		if w.dragging {
-			var pt POINT
-			getCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
-			dx := pt.X - w.dragStartX
-			dy := pt.Y - w.dragStartY
-			// 如果移动距离超过 5 像素，认为是拖动
-			if dx*dx+dy*dy > 25 {
-				w.isDrag = true
+		// 拖拽由 goroutine 负责，此处不处理
+		return 0
+
+	case WM_DRAG_MOVE:
+		// 用 UpdateLayeredWindow 移动分层窗口（不用 SetWindowPos，避免冲突）
+		w.dragMovePending = false
+		if w.dragging && w.hasLastPos {
+			size := SIZE{Cx: int32(w.Width), Cy: int32(w.Height)}
+			ptSrc := POINT{X: 0, Y: 0}
+			ptDst := POINT{X: w.lastNewX, Y: w.lastNewY}
+			blend := BLENDFUNCTION{
+				BlendOp:             AC_SRC_OVER,
+				BlendFlags:          0,
+				SourceConstantAlpha: 255,
+				AlphaFormat:         AC_SRC_ALPHA,
 			}
-			// 如果是拖动，更新位置（使用 SWP_NOREDRAW 避免重绘阻塞）
-			if w.isDrag {
-				newX := w.winStartX + (pt.X - w.dragStartX)
-				newY := w.winStartY + (pt.Y - w.dragStartY)
-				// SWP_NOREDRAW = 0x0008, SWP_NOZORDER = 0x0004, SWP_NOSIZE = 0x0001
-				setWindowPos.Call(uintptr(hwnd), 0, uintptr(newX), uintptr(newY), 0, 0, uintptr(0x0008|SWP_NOZORDER|SWP_NOSIZE))
-			}
+			updateLayeredWindow.Call(
+				uintptr(hwnd),
+				0,
+				uintptr(unsafe.Pointer(&ptDst)),
+				uintptr(unsafe.Pointer(&size)),
+				uintptr(w.memDC),
+				uintptr(unsafe.Pointer(&ptSrc)),
+				0,
+				uintptr(unsafe.Pointer(&blend)),
+				uintptr(ULW_ALPHA),
+			)
 		}
 		return 0
 
+	case WM_TIMER:
+		// 心跳定时器：保持消息队列活跃，防止系统判定窗口"无响应"
+		return 0
+
 	case WM_RBUTTONUP:
-		// 右键松开
 		if w.dragging {
-			releaseCapture.Call()
 			w.dragging = false
-			// 如果不是拖动，则显示菜单
+			w.skipPaint = false
+			w.hasLastPos = false
+			w.dragMovePending = false
 			if !w.isDrag {
+				// 右键单击（非拖拽）：显示右键菜单
+				// 注意：TrackPopupMenu 的内部消息循环可能消费 WM_RBUTTONUP，
+				// 菜单期间用户可能再次右键按下触发 dragging，返回后需强制重置
 				w.showContextMenu(hwnd)
+				w.dragging = false
+				w.skipPaint = false
+				w.hasLastPos = false
+				w.dragMovePending = false
 			}
+			// 拖拽结束后刷新显示
+			postMessageW.Call(uintptr(hwnd), uintptr(WM_UPDATE_DISPLAY), 0, 0)
 		}
 		return 0
 
@@ -569,7 +606,10 @@ func (w *windowsPlatform) wndProc(hwnd HWND, msg uint32, wParam, lParam uintptr)
 		return 0
 
 	case WM_UPDATE_DISPLAY:
-		w.updateDisplay()
+		// 拖拽期间跳过重绘，避免与 WM_DRAG_MOVE 的 UpdateLayeredWindow 冲突
+		if !w.skipPaint {
+			w.updateDisplay()
+		}
 		return 0
 	}
 
@@ -585,9 +625,12 @@ func (w *windowsPlatform) updateDisplay() {
 	pixelCount := w.Width * w.Height * 4
 
 	if w.hasImage {
+		// 加锁保护 basePixels 读写
+		w.pixelMu.Lock()
 		// 复制基础像素到 DIB section
 		dest := unsafe.Slice((*byte)(w.bmpPtr), pixelCount)
 		copy(dest, w.basePixels)
+		w.pixelMu.Unlock()
 
 		// 在 DIB section 上绘制气泡
 		if w.currentBubble != "" {
@@ -930,23 +973,66 @@ func (w *windowsPlatform) Show() {
 	showWindow.Call(uintptr(w.Hwnd), uintptr(SW_SHOW))
 	updateWindow.Call(uintptr(w.Hwnd))
 	w.updateDisplay()
+	// 设置心跳定时器：每 3 秒触发 WM_TIMER，保持消息队列活跃，防止系统判定窗口"无响应"
+	setTimer.Call(uintptr(w.Hwnd), uintptr(HEARTBEAT_TIMER_ID), uintptr(3000), 0)
+}
+
+// startDragGoroutine 启动 goroutine 轮询鼠标状态，完全不依赖 SetCapture
+func (w *windowsPlatform) startDragGoroutine(hwnd HWND) {
+	hwndPtr := uintptr(hwnd)
+	go func() {
+		ticker := time.NewTicker(16 * time.Millisecond) // ~60fps
+		defer ticker.Stop()
+		for range ticker.C {
+			if !w.dragging {
+				return
+			}
+			// 检查右键是否仍然按下
+			state, _, _ := getAsyncKeyState.Call(uintptr(VK_RBUTTON))
+			if state&0x8000 == 0 {
+				// 右键已松开，发送 WM_RBUTTONUP
+				postMessageW.Call(hwndPtr, uintptr(WM_RBUTTONUP), 0, 0)
+				return
+			}
+			// 获取鼠标位置
+			var pt POINT
+			getCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
+			dx := pt.X - w.dragStartX
+			dy := pt.Y - w.dragStartY
+			if !w.isDrag && dx*dx+dy*dy > 25 {
+				w.isDrag = true
+			}
+			if w.isDrag {
+				w.lastNewX = w.winStartX + dx
+				w.lastNewY = w.winStartY + dy
+				w.hasLastPos = true
+				if !w.dragMovePending {
+					w.dragMovePending = true
+					postMessageW.Call(hwndPtr, uintptr(WM_DRAG_MOVE), 0, 0)
+				}
+			}
+		}
+	}()
 }
 
 func (w *windowsPlatform) Run() {
 	w.running = true
 	var msg MSG
+	// 消息循环：使用 PeekMessage（非阻塞）+ Sleep，避免 GetMessage 阻塞。
+	// 关键前提：main goroutine 已通过 runtime.LockOSThread() 绑定到创建窗口的 OS 线程，
+	// 否则 PeekMessage 会在错误的线程上执行，读不到本窗口消息队列的消息。
 	for w.running {
-		ret, _, _ := getMessageW.Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0)
-		if int32(ret) == 0 {
-			// WM_QUIT
-			break
+		ret, _, _ := peekMessageW.Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0, uintptr(PM_REMOVE))
+		if int32(ret) != 0 {
+			if msg.Message == WM_QUIT {
+				break
+			}
+			translateMessage.Call(uintptr(unsafe.Pointer(&msg)))
+			dispatchMessageW.Call(uintptr(unsafe.Pointer(&msg)))
+		} else {
+			// 无消息时短暂休眠，避免忙等待
+			time.Sleep(5 * time.Millisecond)
 		}
-		if int32(ret) == -1 {
-			// 错误
-			break
-		}
-		translateMessage.Call(uintptr(unsafe.Pointer(&msg)))
-		dispatchMessageW.Call(uintptr(unsafe.Pointer(&msg)))
 	}
 }
 
@@ -1202,19 +1288,23 @@ func (w *windowsPlatform) switchToImage(idx int) {
 	w.currentIdx = idx
 	name := w.imageOrder[idx]
 
-	// 计算当前气泡高度
-	bubbleHeight := w.Height - w.imageHeight
+	// 异步加载图片，避免阻塞消息循环
+	go func() {
+		// 计算当前气泡高度
+		bubbleHeight := w.Height - w.imageHeight
 
-	// 加载当前尺寸的图片（使用图片高度，不是窗口总高度）
-	pixels, err := w.loadImageByName(name, w.imageWidth, w.imageHeight, bubbleHeight)
-	if err != nil {
-		fmt.Printf("切换图片失败: %v\n", err)
-		return
-	}
+		// 加载当前尺寸的图片
+		pixels, err := w.loadImageByName(name, w.imageWidth, w.imageHeight, bubbleHeight)
+		if err != nil {
+			return
+		}
 
-	w.basePixels = pixels
-	w.hasImage = true
+		w.pixelMu.Lock()
+		w.basePixels = pixels
+		w.hasImage = true
+		w.pixelMu.Unlock()
 
-	// 更新显示
-	postMessageW.Call(uintptr(w.Hwnd), uintptr(WM_UPDATE_DISPLAY), 0, 0)
+		// 异步更新显示
+		postMessageW.Call(uintptr(w.Hwnd), uintptr(WM_UPDATE_DISPLAY), 0, 0)
+	}()
 }

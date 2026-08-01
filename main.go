@@ -2,9 +2,50 @@ package main
 
 import (
 	"path/filepath"
+	"runtime"
 
 	"desktopPet/platform"
 )
+
+// main 是程序入口。
+// 关键：必须在最开始 runtime.LockOSThread()，将 main goroutine 绑定到一个 OS 线程。
+// Windows 的消息队列和窗口都绑定到创建它们的线程：CreateWindow、PeekMessage、DispatchMessage、
+// UpdateLayeredWindow、wndProc 回调必须在同一个 OS 线程上执行。
+// 若 Go runtime 在某个 syscall 边界把 main goroutine 调度到另一个 OS 线程，
+// PeekMessage 就会读不到原线程消息队列里的消息（表现为：循环在跑但 processed 0 msgs），
+// 系统随后判定窗口 hung 并创建 Ghost 窗口接管输入，导致"卡死"。
+func main() {
+	runtime.LockOSThread()
+
+	exePath, _ := filepath.Abs(".")
+	_ = exePath
+
+	p, err := platform.NewPlatform()
+	if err != nil {
+		panic(err)
+	}
+
+	err = p.Init()
+	if err != nil {
+		panic(err)
+	}
+
+	petWidth := 200
+	petHeight := 300
+
+	x, y := 100, 100
+
+	err = p.CreateWindow("桌面宠物", x, y, petWidth, petHeight)
+	if err != nil {
+		panic(err)
+	}
+
+	p.Show()
+
+	dp := NewDesktopPet(p)
+
+	dp.Start()
+}
 
 // 图片对应的气泡文字
 var imageTexts = map[string]string{
@@ -65,36 +106,4 @@ func (dp *DesktopPet) Start() {
 func (dp *DesktopPet) Stop() {
 	dp.running = false
 	dp.platform.Close()
-}
-
-func main() {
-	// 设置 DLL 目录（确保从正确的路径加载）
-	exePath, _ := filepath.Abs(".")
-	_ = exePath
-
-	p, err := platform.NewPlatform()
-	if err != nil {
-		panic(err)
-	}
-
-	err = p.Init()
-	if err != nil {
-		panic(err)
-	}
-
-	petWidth := 200
-	petHeight := 300
-
-	x, y := 100, 100
-
-	err = p.CreateWindow("桌面宠物", x, y, petWidth, petHeight)
-	if err != nil {
-		panic(err)
-	}
-
-	p.Show()
-
-	dp := NewDesktopPet(p)
-
-	dp.Start()
 }
