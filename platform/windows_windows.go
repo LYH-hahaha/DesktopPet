@@ -95,11 +95,17 @@ const (
 	MF_STRING     = 0x00000000
 	MF_POPUP      = 0x00000010
 	MF_SEPARATOR  = 0x00000800
+	MF_CHECKED    = 0x00000008
 	TPM_LEFTALIGN = 0x0000
 
-	// 菜单 ID
-	ID_SIZE_INCREASE   = 1001
-	ID_SIZE_DECREASE   = 1002
+	// 菜单 ID - 调整大小档位（-6/-4/-2/0/+2/+4/+6）
+	ID_SIZE_NEG6       = 1010
+	ID_SIZE_NEG4       = 1011
+	ID_SIZE_NEG2       = 1012
+	ID_SIZE_0          = 1013
+	ID_SIZE_POS2       = 1014
+	ID_SIZE_POS4       = 1015
+	ID_SIZE_POS6       = 1016
 	ID_EXIT            = 1003
 	ID_EXPRESSION_BASE = 2000 // 表情菜单 ID 从 2000 开始
 
@@ -238,7 +244,8 @@ type windowsPlatform struct {
 	imageHeight  int
 	bubbleHeight int // 动态气泡高度
 	// 缩放
-	scale float64 // 当前缩放比例
+	scale     float64 // 当前缩放比例
+	sizeLevel int     // 当前大小档位（-6/-4/-2/0/+2/+4/+6）
 	// 右键拖动/单击
 	dragStartX      int32
 	dragStartY      int32
@@ -293,7 +300,7 @@ func (w *windowsPlatform) CreateWindow(title string, x, y, width, height int) er
 }
 
 // 加载单个图片并返回像素数据（统一尺寸，带偏移）
-func (w *windowsPlatform) loadImageByName(name string, targetWidth, targetHeight int, offsetY int) ([]byte, error) {
+func (w *windowsPlatform) loadImageByName(name string, dibWidth, dibHeight, imageDrawWidth, imageDrawHeight, offsetY int) ([]byte, error) {
 	exePath, _ := os.Executable()
 	paths := []string{
 		filepath.Join("assets", name+".png"),
@@ -321,19 +328,19 @@ func (w *windowsPlatform) loadImageByName(name string, targetWidth, targetHeight
 	origW := bounds.Dx()
 	origH := bounds.Dy()
 
-	// 使用目标尺寸
-	width := targetWidth
-	height := targetHeight
+	// DIB 尺寸（窗口大小，可能比图片宽以容纳气泡）
+	width := dibWidth
+	height := dibHeight
 
-	// 计算缩放比例（保持宽高比）
-	scaleW := float64(width) / float64(origW)
-	scaleH := float64(height) / float64(origH)
+	// 图片缩放比例基于实际绘制尺寸（不是 DIB 宽度）
+	scaleW := float64(imageDrawWidth) / float64(origW)
+	scaleH := float64(imageDrawHeight) / float64(origH)
 	scale := scaleW
 	if scaleH < scaleW {
 		scale = scaleH
 	}
 
-	// 计算实际绘制区域（居中）
+	// 计算实际绘制区域（在 DIB 中居中）
 	drawW := int(float64(origW) * scale)
 	drawH := int(float64(origH) * scale)
 	offsetX := (width - drawW) / 2
@@ -385,16 +392,25 @@ func (w *windowsPlatform) loadAllImages() error {
 	w.images = make(map[string][]byte)
 	w.imageOrder = imageNames
 	w.currentIdx = 0
-	w.scale = 1.0 // 初始化缩放比例
+	// 默认缩放：档位0对应的 scale，字体和气泡区域不随缩放变化
+	w.scale = scaleForLevel(0) // ≈ 0.402
+	w.sizeLevel = 0            // 默认档位
 
-	// 统一显示尺寸（宽度不变，高度增加给气泡留空间）
-	displayWidth := 200
-	displayHeight := 300
-	bubbleHeight := 80 // 气泡区域高度（调整到合适的距离）
+	// 基础尺寸（scale=1.0 时的尺寸）
+	baseWidth := 200
+	baseImageHeight := 300
+	bubbleHeight := 100 // 气泡区域高度固定，不随缩放变化（保证字体不变）
 
-	// 加载所有图片（统一尺寸）
+	// 窗口宽度固定为 baseWidth（=气泡最大宽度），图片在窗口中居中显示
+	// 这样气泡可以比图片宽，文字一行能放更多字符，减少行数避免遮挡人物
+	windowWidth := baseWidth
+	// 图片实际显示尺寸（随缩放）
+	imageDrawWidth := int(float64(baseWidth) * w.scale)
+	imageDrawHeight := int(float64(baseImageHeight) * w.scale)
+
+	// 加载所有图片（DIB 宽度=窗口宽度，图片在 DIB 中居中）
 	for _, name := range imageNames {
-		pixels, err := w.loadImageByName(name, displayWidth, displayHeight, bubbleHeight)
+		pixels, err := w.loadImageByName(name, windowWidth, imageDrawHeight, imageDrawWidth, imageDrawHeight, bubbleHeight)
 		if err != nil {
 			fmt.Printf("加载图片失败: %s, %v\n", name, err)
 			continue
@@ -403,10 +419,10 @@ func (w *windowsPlatform) loadAllImages() error {
 	}
 
 	// 设置尺寸和当前图片（窗口高度 = 图片高度 + 气泡高度）
-	w.Width = displayWidth
-	w.Height = displayHeight + bubbleHeight
-	w.imageWidth = displayWidth
-	w.imageHeight = displayHeight
+	w.Width = windowWidth
+	w.Height = imageDrawHeight + bubbleHeight
+	w.imageWidth = imageDrawWidth
+	w.imageHeight = imageDrawHeight
 	w.basePixels = w.images[imageNames[0]]
 	w.hasImage = true
 
@@ -695,31 +711,35 @@ func (w *windowsPlatform) drawBubbleOnPixels(pixels []byte) {
 		return
 	}
 
-	// 根据缩放比例调整文字和气泡大小
-	scale := w.scale
-	if scale < 0.1 {
-		scale = 1.0
-	}
+	// 字体和气泡布局使用固定大小（不随图片缩放变化），保证字体始终清晰可读
+	scale := 1.0
 
-	// 根据文字长度计算气泡尺寸（缩放后）
-	charWidth := int(18 * scale)  // 中文字符宽度估算（增加间距）
-	lineHeight := int(28 * scale) // 行高（增加）
-	maxCharsPerLine := 10         // 每行最大字符数
-	padding := int(20 * scale)    // 内边距（增加）
+	// 根据文字长度计算气泡尺寸（字体固定不随缩放变化）
+	charWidth := int(18 * scale)  // 中文字符宽度估算
+	lineHeight := int(28 * scale) // 行高
+	padding := int(20 * scale)    // 内边距
 
-	// 计算需要的行数
-	textLen := len([]rune(text))
-	lines := (textLen + maxCharsPerLine - 1) / maxCharsPerLine
-	if lines < 1 {
-		lines = 1
-	}
-
-	// 计算气泡尺寸
+	// 计算气泡宽度（窗口固定 200 宽，气泡可以比图片宽，上下布局）
 	minBubbleW := int(100 * scale)
 	bubbleW := max(len([]rune(text))*charWidth+padding*2, minBubbleW)
 	maxBubbleW := int(200 * scale)
 	if bubbleW > maxBubbleW {
 		bubbleW = maxBubbleW
+	}
+
+	// 根据气泡实际宽度计算每行字符数和行数（避免文字超出气泡边界）
+	availTextW := bubbleW - padding*2
+	if availTextW < charWidth {
+		availTextW = charWidth
+	}
+	maxCharsPerLine := availTextW / charWidth
+	if maxCharsPerLine < 1 {
+		maxCharsPerLine = 1
+	}
+	textLen := len([]rune(text))
+	lines := (textLen + maxCharsPerLine - 1) / maxCharsPerLine
+	if lines < 1 {
+		lines = 1
 	}
 	bubbleH := lines*lineHeight + padding*2
 
@@ -731,31 +751,55 @@ func (w *windowsPlatform) drawBubbleOnPixels(pixels []byte) {
 	// 气泡显示在窗口顶部（上方空白区域）
 	bubbleY := 10
 
-	// 圆角半径（缩放后）
-	radius := int(12 * scale)
+	// 圆角半径（更大更圆润）
+	radius := int(16 * scale)
 
-	// 绘制阴影（偏移根据缩放）
-	shadowOffset := int(3 * scale)
-	shadowColor := [4]byte{180, 180, 180, 100} // 灰色半透明阴影
-	for y := bubbleY + shadowOffset; y < bubbleY+bubbleH+shadowOffset && y < w.Height; y++ {
-		for x := bubbleX + shadowOffset; x < bubbleX+bubbleW+shadowOffset && x < w.Width; x++ {
+	// 气泡尾巴（底部中间向下凸出的三角形，指向人物）
+	tailW := int(20 * scale) // 尾巴宽度
+	tailH := int(10 * scale) // 尾巴高度
+
+	// 判断点是否在气泡形状内（圆角矩形 + 底部尾巴）
+	inBubble := func(px, py int) bool {
+		rx := px - bubbleX
+		ry := py - bubbleY
+		if rx < 0 || rx >= bubbleW || ry < 0 {
+			return false
+		}
+		// 尾巴区域（底部向下延伸的三角形）
+		if ry >= bubbleH {
+			if ry < bubbleH+tailH {
+				p := float64(ry-bubbleH) / float64(tailH)
+				halfW := float64(tailW)/2*(1-p) + 1
+				cx := float64(bubbleW) / 2
+				return float64(rx) >= cx-halfW && float64(rx) <= cx+halfW
+			}
+			return false
+		}
+		// 圆角矩形
+		dx := 0
+		dy := 0
+		if rx < radius {
+			dx = radius - rx
+		} else if rx >= bubbleW-radius {
+			dx = rx - (bubbleW - radius) + 1
+		}
+		if ry < radius {
+			dy = radius - ry
+		} else if ry >= bubbleH-radius {
+			dy = ry - (bubbleH - radius) + 1
+		}
+		return dx*dx+dy*dy <= radius*radius
+	}
+
+	// 绘制柔和阴影（偏移2px，很淡）
+	shadowOffset := int(2 * scale)
+	shadowColor := [4]byte{100, 100, 100, 60}
+	for y := bubbleY + shadowOffset; y < bubbleY+bubbleH+tailH+shadowOffset && y < w.Height; y++ {
+		for x := bubbleX - tailW + shadowOffset; x < bubbleX+bubbleW+tailW+shadowOffset && x < w.Width; x++ {
 			if x < 0 || y < 0 {
 				continue
 			}
-			// 圆角判断
-			dx := 0
-			dy := 0
-			if x-bubbleX-shadowOffset < radius {
-				dx = radius - (x - bubbleX - shadowOffset)
-			} else if x-bubbleX-shadowOffset >= bubbleW-radius {
-				dx = (x - bubbleX - shadowOffset) - (bubbleW - radius) + 1
-			}
-			if y-bubbleY-shadowOffset < radius {
-				dy = radius - (y - bubbleY - shadowOffset)
-			} else if y-bubbleY-shadowOffset >= bubbleH-radius {
-				dy = (y - bubbleY - shadowOffset) - (bubbleH - radius) + 1
-			}
-			if dx*dx+dy*dy <= radius*radius {
+			if inBubble(x-shadowOffset, y-shadowOffset) {
 				idx := (y*w.Width + x) * 4
 				pixels[idx+0] = blendChannel(pixels[idx+0], shadowColor[0], shadowColor[3])
 				pixels[idx+1] = blendChannel(pixels[idx+1], shadowColor[1], shadowColor[3])
@@ -767,78 +811,19 @@ func (w *windowsPlatform) drawBubbleOnPixels(pixels []byte) {
 		}
 	}
 
-	// 绘制气泡背景（渐变白色）
-	for y := bubbleY; y < bubbleY+bubbleH && y < w.Height; y++ {
-		for x := bubbleX; x < bubbleX+bubbleW && x < w.Width; x++ {
-			if x < 0 || y < 0 {
+	// 绘制气泡背景（纯白色，无渐变无边框，更像消息气泡）
+	bgColor := [4]byte{255, 255, 255, 253}
+	for y := bubbleY; y < bubbleY+bubbleH+tailH && y < w.Height; y++ {
+		for x := bubbleX - tailW; x < bubbleX+bubbleW+tailW && x < w.Width; x++ {
+			if x < 0 {
 				continue
 			}
-			// 圆角判断
-			dx := 0
-			dy := 0
-			if x-bubbleX < radius {
-				dx = radius - (x - bubbleX)
-			} else if x-bubbleX >= bubbleW-radius {
-				dx = (x - bubbleX) - (bubbleW - radius) + 1
-			}
-			if y-bubbleY < radius {
-				dy = radius - (y - bubbleY)
-			} else if y-bubbleY >= bubbleH-radius {
-				dy = (y - bubbleY) - (bubbleH - radius) + 1
-			}
-			if dx*dx+dy*dy <= radius*radius {
-				// 渐变效果：从上到下略微变深
-				gradient := uint8(255 - (y-bubbleY)*20/bubbleH)
+			if inBubble(x, y) {
 				idx := (y*w.Width + x) * 4
-				pixels[idx+0] = blendChannel(pixels[idx+0], gradient, 240) // B
-				pixels[idx+1] = blendChannel(pixels[idx+1], gradient, 240) // G
-				pixels[idx+2] = blendChannel(pixels[idx+2], 255, 240)      // R (淡粉色)
-				pixels[idx+3] = 255                                        // A
-			}
-		}
-	}
-
-	// 绘制气泡边框（淡蓝色，宽度根据缩放）
-	borderWidth := max(1, int(2*scale))
-	borderColor := [4]byte{100, 149, 237, 255} // 矢车菊蓝
-	for y := bubbleY; y < bubbleY+bubbleH && y < w.Height; y++ {
-		for x := bubbleX; x < bubbleX+bubbleW && x < w.Width; x++ {
-			if x < 0 || y < 0 {
-				continue
-			}
-			// 检查是否是边框（距离边界 borderWidth 像素内）
-			isBorder := false
-			// 圆角判断
-			dx := 0
-			dy := 0
-			if x-bubbleX < radius {
-				dx = radius - (x - bubbleX)
-			} else if x-bubbleX >= bubbleW-radius {
-				dx = (x - bubbleX) - (bubbleW - radius) + 1
-			}
-			if y-bubbleY < radius {
-				dy = radius - (y - bubbleY)
-			} else if y-bubbleY >= bubbleH-radius {
-				dy = (y - bubbleY) - (bubbleH - radius) + 1
-			}
-			// 计算到边缘的距离
-			insideRadius := dx*dx + dy*dy
-			if insideRadius <= radius*radius {
-				// 检查是否在边框范围内
-				borderDist := min(
-					min(x-bubbleX, bubbleX+bubbleW-x),
-					min(y-bubbleY, bubbleY+bubbleH-y),
-				)
-				if borderDist >= 0 && borderDist < borderWidth {
-					isBorder = true
-				}
-			}
-			if isBorder {
-				idx := (y*w.Width + x) * 4
-				pixels[idx+0] = borderColor[0] // B
-				pixels[idx+1] = borderColor[1] // G
-				pixels[idx+2] = borderColor[2] // R
-				pixels[idx+3] = borderColor[3] // A
+				pixels[idx+0] = bgColor[0] // B
+				pixels[idx+1] = bgColor[1] // G
+				pixels[idx+2] = bgColor[2] // R
+				pixels[idx+3] = bgColor[3] // A
 			}
 		}
 	}
@@ -1136,13 +1121,30 @@ func (w *windowsPlatform) showContextMenu(hwnd HWND) {
 		return
 	}
 
-	// 创建"调整大小"子菜单
+	// 创建"调整大小"子菜单（档位选择：-6/-4/-2/0/+2/+4/+6）
 	hSizeMenu, _, _ := createPopupMenu.Call()
 	if hSizeMenu != 0 {
-		increasePtr, _ := syscall.UTF16PtrFromString("  🔍 放大 (+)  ")
-		decreasePtr, _ := syscall.UTF16PtrFromString("  🔍 缩小 (-)  ")
-		appendMenuW.Call(hSizeMenu, MF_STRING, uintptr(ID_SIZE_INCREASE), uintptr(unsafe.Pointer(increasePtr)))
-		appendMenuW.Call(hSizeMenu, MF_STRING, uintptr(ID_SIZE_DECREASE), uintptr(unsafe.Pointer(decreasePtr)))
+		sizeLevels := []struct {
+			id    int
+			level int
+			label string
+		}{
+			{ID_SIZE_NEG6, -6, "  🔍 -6  "},
+			{ID_SIZE_NEG4, -4, "  🔍 -4  "},
+			{ID_SIZE_NEG2, -2, "  🔍 -2  "},
+			{ID_SIZE_0, 0, "  📌 0   "},
+			{ID_SIZE_POS2, 2, "  🔍 +2  "},
+			{ID_SIZE_POS4, 4, "  🔍 +4  "},
+			{ID_SIZE_POS6, 6, "  🔍 +6  "},
+		}
+		for _, lv := range sizeLevels {
+			flags := uint32(MF_STRING)
+			if w.sizeLevel == lv.level {
+				flags |= MF_CHECKED
+			}
+			ptr, _ := syscall.UTF16PtrFromString(lv.label)
+			appendMenuW.Call(hSizeMenu, uintptr(flags), uintptr(lv.id), uintptr(unsafe.Pointer(ptr)))
+		}
 
 		sizePtr, _ := syscall.UTF16PtrFromString("📐 调整大小")
 		appendMenuW.Call(hMenu, MF_STRING|MF_POPUP, hSizeMenu, uintptr(unsafe.Pointer(sizePtr)))
@@ -1196,20 +1198,27 @@ func (w *windowsPlatform) showContextMenu(hwnd HWND) {
 // 处理菜单命令
 func (w *windowsPlatform) handleMenuCommand(menuID int) {
 	switch {
-	case menuID == ID_SIZE_INCREASE:
-		// 放大
-		w.scale *= 1.2
-		if w.scale > 3.0 {
-			w.scale = 3.0
+	case menuID >= ID_SIZE_NEG6 && menuID <= ID_SIZE_POS6:
+		// 档位选择：根据档位设置 scale
+		var level int
+		switch menuID {
+		case ID_SIZE_NEG6:
+			level = -6
+		case ID_SIZE_NEG4:
+			level = -4
+		case ID_SIZE_NEG2:
+			level = -2
+		case ID_SIZE_0:
+			level = 0
+		case ID_SIZE_POS2:
+			level = 2
+		case ID_SIZE_POS4:
+			level = 4
+		case ID_SIZE_POS6:
+			level = 6
 		}
-		w.resizeImage()
-
-	case menuID == ID_SIZE_DECREASE:
-		// 缩小
-		w.scale /= 1.2
-		if w.scale < 0.3 {
-			w.scale = 0.3
-		}
+		w.scale = scaleForLevel(level)
+		w.sizeLevel = level
 		w.resizeImage()
 
 	case menuID == ID_EXIT:
@@ -1229,6 +1238,23 @@ func (w *windowsPlatform) handleMenuCommand(menuID int) {
 	}
 }
 
+// 根据档位计算缩放比例（档位0 = 默认大小，+n放大n个度，-n缩小n个度）
+func scaleForLevel(level int) float64 {
+	baseScale := 1.0 / (1.2 * 1.2 * 1.2 * 1.2 * 1.2) // 档位0的基准
+	factor := 1.0
+	abs := level
+	if abs < 0 {
+		abs = -abs
+	}
+	for i := 0; i < abs; i++ {
+		factor *= 1.2
+	}
+	if level >= 0 {
+		return baseScale * factor
+	}
+	return baseScale / factor
+}
+
 // 调整图片大小
 func (w *windowsPlatform) resizeImage() {
 	if len(w.imageOrder) == 0 {
@@ -1238,17 +1264,20 @@ func (w *windowsPlatform) resizeImage() {
 	// 基础尺寸
 	baseWidth := 200
 	baseImageHeight := 300
-	baseBubbleHeight := 80 // 气泡区域高度
+	baseBubbleHeight := 100 // 气泡区域高度固定，不随缩放变化（保证字体不变）
 
-	// 计算新尺寸
-	newWidth := int(float64(baseWidth) * w.scale)
+	// 窗口宽度固定为 baseWidth（=气泡最大宽度），图片在窗口中居中
+	newWidth := baseWidth
 	newImageHeight := int(float64(baseImageHeight) * w.scale)
-	newBubbleHeight := int(float64(baseBubbleHeight) * w.scale)
+	newBubbleHeight := baseBubbleHeight
 	newTotalHeight := newImageHeight + newBubbleHeight
+	// 图片实际绘制尺寸（随缩放）
+	imageDrawWidth := int(float64(baseWidth) * w.scale)
+	imageDrawHeight := newImageHeight
 
-	// 重新加载当前图片
+	// 重新加载当前图片（DIB 宽度=窗口宽度，图片居中）
 	currentName := w.imageOrder[w.currentIdx]
-	pixels, err := w.loadImageByName(currentName, newWidth, newImageHeight, newBubbleHeight)
+	pixels, err := w.loadImageByName(currentName, newWidth, imageDrawHeight, imageDrawWidth, imageDrawHeight, newBubbleHeight)
 	if err != nil {
 		fmt.Printf("调整大小失败: %v\n", err)
 		return
@@ -1257,8 +1286,8 @@ func (w *windowsPlatform) resizeImage() {
 	// 更新尺寸
 	w.Width = newWidth
 	w.Height = newTotalHeight
-	w.imageWidth = newWidth
-	w.imageHeight = newImageHeight
+	w.imageWidth = imageDrawWidth
+	w.imageHeight = imageDrawHeight
 	w.basePixels = pixels
 
 	// 重新创建 DIB section
@@ -1293,8 +1322,8 @@ func (w *windowsPlatform) switchToImage(idx int) {
 		// 计算当前气泡高度
 		bubbleHeight := w.Height - w.imageHeight
 
-		// 加载当前尺寸的图片
-		pixels, err := w.loadImageByName(name, w.imageWidth, w.imageHeight, bubbleHeight)
+		// 加载当前尺寸的图片（DIB 宽度=窗口宽度，图片在 DIB 中居中）
+		pixels, err := w.loadImageByName(name, w.Width, w.imageHeight, w.imageWidth, w.imageHeight, bubbleHeight)
 		if err != nil {
 			return
 		}
