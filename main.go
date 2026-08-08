@@ -49,7 +49,7 @@ func main() {
 
 // 图片对应的气泡文字
 var imageTexts = map[string]string{
-	"主体":  "你好呀~我是你的桌面小宠物!",
+	"主体":  "小跳小跳，我来啦!",
 	"挥手":  "再见啦~下次见!",
 	"奔跑":  "跑跑跑~好开心!",
 	"跳跃":  "蹦蹦跳跳~",
@@ -98,7 +98,7 @@ func (dp *DesktopPet) Start() {
 	dp.platform.SetOnExpressionChange(dp.HandleExpressionChange)
 
 	// 显示初始气泡
-	dp.platform.ShowBubble("你好呀~我是你的桌面小宠物!")
+	dp.platform.ShowBubble("小跳小跳，我来啦!")
 
 	dp.platform.Run()
 }
